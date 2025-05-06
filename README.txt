@@ -20,18 +20,4 @@ Lucene vs. your search engine
 Reranking the top results with an LLM via prompting is likely to raise your results substantially (and it is not too hard to implement).
 
 
-4/30/25
-should just be build the index, query the index, done
-check Wikipedia pages, highly parseable but really take a look at it
-lucene builds index
-searcher & analyzer
-searcher queries the index and analyzer analyzes
-
-searcher queries the index with the question and the category, gets some hits
-bm25 ranks the hits
-take the top 10
-check if the answer is in the top 10
-
-start with better parsing:
-get rid of [tpl]
-separate fields for titles, categories (if categories match, rank higher), summaries, and then actual bodies, metadata
+Wiki subset not present
