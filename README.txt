@@ -1,23 +1,8 @@
-PROJECT NOTES:
-The questions were extracted from j-archive.com, from shows that took place between 2013-01-01 and 2013-01-07.
+Files too big for Github:
+bm25.pkl: https://drive.google.com/file/d/1Vjo2yzUoOPeHK2091S39RB12CEoShL6X/view?usp=drive_link
+embeddings.npy: https://drive.google.com/file/d/1MaCYYhMN_XzBrqeCEJGxxGWET1HK545z/view?usp=drive_link
+faiss_hnsw.index: https://drive.google.com/file/d/1COb-wjQoJ2-D_PFQsMFEEnqKykI-4J40/view?usp=drive_link
+ranker.pkl: https://drive.google.com/file/d/1L1wpLzOFbpW7PdUcd9q-OU0KZiBWwt1S/view?usp=drive_link
+wiki-subset: https://drive.google.com/drive/folders/1HimFkbhsD2-4D4OwJvIoASiK-t5GSYj2?usp=drive_link
 
-Browse some of the Jeopardy! questions (and answers) in the attached file (input: first two line of each block; expected output: third line of each block (it is the title of a Wikipedia page)). If you don't look at the expected output, can you find the correct Wikipedia page via keyword search?
-
-Expected results (not a hard cutoff): Precision@1 > 0.40 and MRR > 0.50.
-
-It is harder than it seems
-Your solution must be generic
-Don’t implement anything that is specific to the 100 questions
-It must work when the answer is any of the 280k articles
-Indexing 280k wikipedia articles is tricky
-~123,221,423 tokens
-Preprocessing
-Parsing the article
-Tokenizing, stemming, and so on
-Do you index the whole thing?
-Lucene vs. your search engine
-
-Reranking the top results with an LLM via prompting is likely to raise your results substantially (and it is not too hard to implement).
-
-
-Wiki subset not present
+My code can build all of these from scratch, but it does check for the files first and will run significantly faster if they're already present in the directory.
