@@ -1,0 +1,170 @@
+import os
+import re
+import pickle
+import numpy as np
+from sentence_transformers import SentenceTransformer, CrossEncoder
+import faiss
+from rank_bm25 import BM25Okapi
+from sklearn.linear_model import LogisticRegression
+from collections import defaultdict
+
+WIKI_DIR = "wiki-subset"
+QUESTIONS_FILE = "questions.txt"
+BM25_INDEX_FILE = "bm25.pkl"
+FAISS_INDEX_FILE = "faiss_hnsw.index"
+EMB_FILE = "embeddings.npy"
+RANKER_FILE = "ranker.pkl"
+TOP_K = 10
+BM25_K = 50
+MODEL_NAME = 'all-MiniLM-L6-v2'
+CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-12-v2'
+SNIPPET_WORDS = 500
+BATCH_SIZE = 64
+
+def load_documents():
+    titles, texts, categories = [], [], []
+    tpl_re = re.compile(r"\[tpl\].*?\[/tpl\]")
+    title, buffer, cats = None, [], []
+    for root, _, files in os.walk(WIKI_DIR):
+        for fname in files:
+            with open(os.path.join(root, fname), 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = tpl_re.sub('', line).strip()
+                    m = re.match(r'^\[\[(.+?)\]\]', line)
+                    if m:
+                        if title is not None:
+                            titles.append(title); texts.append(' '.join(buffer)); categories.append(cats)
+                        title = m.group(1)
+                        buffer, cats = [], []
+                    elif line.startswith('CATEGORIES:'):
+                        cat_list = line.split(':',1)[1].split(',')
+                        cats = [c.strip().lower() for c in cat_list]
+                    else:
+                        if title is not None:
+                            buffer.append(line)
+                if title is not None:
+                    titles.append(title); texts.append(' '.join(buffer)); categories.append(cats)
+    return titles, texts, categories
+
+def load_questions():
+    queries = []
+    with open(QUESTIONS_FILE, 'r', encoding='utf-8') as f:
+        block = []
+        for raw in f:
+            line = raw.strip()
+            if not line and len(block) == 3:
+                qcat, clue, ans = block[0].lower(), block[1], block[2]
+                queries.append((qcat, clue, ans))
+                block = []
+            elif line:
+                block.append(line)
+        if len(block) == 3:
+            queries.append((block[0].lower(), block[1], block[2]))
+    return queries
+
+def get_bm25(texts):
+    if os.path.exists(BM25_INDEX_FILE):
+        with open(BM25_INDEX_FILE, 'rb') as f: bm25, tokenized = pickle.load(f)
+    else:
+        tokenized = [doc.lower().split() for doc in texts]
+        bm25 = BM25Okapi(tokenized)
+        with open(BM25_INDEX_FILE, 'wb') as f: pickle.dump((bm25, tokenized), f)
+    return bm25, tokenized
+
+def get_faiss_index(texts, model):
+    if os.path.exists(FAISS_INDEX_FILE) and os.path.exists(EMB_FILE):
+        index = faiss.read_index(FAISS_INDEX_FILE)
+        embeddings = np.load(EMB_FILE)
+    else:
+        embeddings = []
+        for i in range(0, len(texts), BATCH_SIZE):
+            batch = texts[i:i+BATCH_SIZE]
+            emb = model.encode(batch, batch_size=BATCH_SIZE, show_progress_bar=True, convert_to_numpy=True)
+            embeddings.append(emb)
+        embeddings = np.vstack(embeddings)
+        faiss.normalize_L2(embeddings)
+        np.save(EMB_FILE, embeddings)
+        dim = embeddings.shape[1]
+        index = faiss.IndexHNSWFlat(dim, 32)
+        index.hnsw.efConstruction = 200
+        index.add(embeddings)
+        index.hnsw.efSearch = 50
+        faiss.write_index(index, FAISS_INDEX_FILE)
+    return index, embeddings
+
+def train_ranker(titles, texts, categories, bm25, tokenized, index, embeddings, dense_model, cross_encoder, queries):
+    features, labels, ce_pairs = [], [], []
+    for qcat, clue, expected in queries:
+        qcat = qcat.lower()
+        bm_scores = bm25.get_scores(clue.lower().split())
+        top_bm = np.argsort(bm_scores)[::-1][:BM25_K]
+        q_emb = dense_model.encode([clue], convert_to_numpy=True).flatten()
+        faiss.normalize_L2(q_emb.reshape(1, -1))
+        sims, idxs = index.search(q_emb.reshape(1, -1), TOP_K)
+        top_dn = idxs[0]
+        union = list(dict.fromkeys(list(top_dn) + top_bm.tolist()))[:TOP_K+BM25_K]
+        for idx in union:
+            bmv = float(bm_scores[idx])
+            dnv = float(np.dot(q_emb, embeddings[idx]))
+            catv = 1.0 if qcat in categories[idx] else 0.0
+            features.append([bmv, dnv, None, catv])
+            snippet = ' '.join(texts[idx].split()[:SNIPPET_WORDS])
+            ce_pairs.append([clue, snippet])
+            labels.append(1 if titles[idx].lower() == expected.lower() else 0)
+    ce_scores = cross_encoder.predict(ce_pairs, batch_size=64)
+    for i, score in enumerate(ce_scores):
+        features[i][2] = float(score)
+    X = np.array(features)
+    y = np.array(labels)
+    model = LogisticRegression(max_iter=500)
+    model.fit(X, y)
+    with open(RANKER_FILE, 'wb') as f:
+        pickle.dump(model, f)
+    return model
+
+def evaluate(titles, texts, categories, bm25, tokenized, index, embeddings, dense_model, cross_encoder, ranker, queries):
+    correct, rr_sum = 0, 0.0
+    for qcat, clue, expected in queries:
+        qcat=qcat.lower()
+        bm_scores = bm25.get_scores(clue.lower().split())
+        q_emb = dense_model.encode([clue], convert_to_numpy=True).flatten()
+        faiss.normalize_L2(q_emb.reshape(1, -1))
+        sims, idxs = index.search(q_emb.reshape(1, -1), TOP_K)
+        union = list(dict.fromkeys(list(idxs[0]) + list(np.argsort(bm_scores)[::-1][:BM25_K])))
+        feats, cands = [], []
+        for idx in union:
+            bmv = float(bm_scores[idx]); dnv = float(np.dot(q_emb, embeddings[idx]));
+            ce = cross_encoder.predict([[clue, ' '.join(texts[idx].split()[:SNIPPET_WORDS])]])[0]
+            catv = 1.0 if qcat in categories[idx] else 0.0
+            feats.append([bmv, dnv, float(ce), catv]); cands.append(titles[idx])
+        probs = ranker.predict_proba(np.array(feats))[:,1]
+        order = np.argsort(probs)[::-1]
+        ranked = [cands[i] for i in order[:TOP_K]]
+        if ranked and ranked[0].lower()==expected.lower(): correct+=1
+        rr=0
+        for r,title in enumerate(ranked,1):
+            if title.lower()==expected.lower(): rr=1/r; break
+        rr_sum+=rr
+    total=len(queries)
+    print(f"Precision@1: {correct/total:.4f}")
+    print(f"MRR:         {rr_sum/total:.4f}")
+
+if __name__=='__main__':
+    titles, texts, categories = load_documents()
+    queries = load_questions()
+    bm25, tokenized = get_bm25(texts)
+    dense_model = SentenceTransformer(MODEL_NAME)
+    cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL, device='cpu')
+    index, embeddings = get_faiss_index(texts, dense_model)
+    if os.path.exists(RANKER_FILE):
+        with open(RANKER_FILE,'rb') as f: ranker=pickle.load(f)
+    else:
+        ranker = train_ranker(titles, texts, categories, bm25, tokenized,
+                              index, embeddings, dense_model,
+                              cross_encoder, queries)
+    evaluate(titles, texts, categories, bm25, tokenized,
+             index, embeddings, dense_model,
+             cross_encoder, ranker, queries)
+
+Precision@1: 0.2600
+MRR:         0.3105

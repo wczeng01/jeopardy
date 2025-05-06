@@ -1,0 +1,113 @@
+import os
+import re
+import pickle
+import numpy as np
+from rank_bm25 import BM25Okapi
+
+WIKI_DIR = "wiki-subset"
+QUESTIONS_FILE = "questions.txt"
+BM25_INDEX_FILE = "bm25.pkl"
+TOP_K = 10
+
+def load_documents():
+    titles, texts, categories = [], [], []
+    tpl_re = re.compile(r"\[tpl\].*?\[/tpl\]")
+    title, buffer, cats = None, [], []
+    for root, _, files in os.walk(WIKI_DIR):
+        for fname in files:
+            path = os.path.join(root, fname)
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = tpl_re.sub('', line).strip()
+                    m = re.match(r'^\[\[(.+?)\]\]', line)
+                    if m:
+                        if title is not None:
+                            titles.append(title)
+                            texts.append(' '.join(buffer))
+                            categories.append(cats)
+                        title = m.group(1)
+                        buffer = []
+                        cats = []
+                    elif line.startswith('CATEGORIES:'):
+                        cat_list = line.split(':',1)[1].split(',')
+                        cats = [c.strip().lower() for c in cat_list]
+                    else:
+                        if title is not None:
+                            buffer.append(line)
+                if title is not None:
+                    titles.append(title)
+                    texts.append(' '.join(buffer))
+                    categories.append(cats)
+    return titles, texts, categories
+
+def load_questions():
+    queries = []
+    with open(QUESTIONS_FILE, 'r', encoding='utf-8') as f:
+        block = []
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                if len(block) == 3:
+                    qcat = block[0].lower().strip()
+                    clue = block[1]
+                    answer = block[2]
+                    queries.append((qcat, clue, answer))
+                block = []
+            else:
+                block.append(line)
+        if len(block) == 3:
+            qcat = block[0].lower().strip()
+            queries.append((qcat, block[1], block[2]))
+    return queries
+
+from pathlib import Path
+def get_bm25(texts):
+    if Path(BM25_INDEX_FILE).exists():
+        with open(BM25_INDEX_FILE, 'rb') as f:
+            bm25, tokenized = pickle.load(f)
+    else:
+        tokenized = [doc.lower().split() for doc in texts]
+        bm25 = BM25Okapi(tokenized)
+        with open(BM25_INDEX_FILE, 'wb') as f:
+            pickle.dump((bm25, tokenized), f)
+    return bm25, tokenized
+
+def evaluate(titles, texts, categories_map, bm25, tokenized, queries):
+    correct_at1 = 0
+    rr_sum = 0.0
+    for qcat, clue, expected in queries:
+        scores = bm25.get_scores(clue.lower().split())
+        for idx in categories_map.get(qcat, []):
+            scores[idx] += 5.0  # arbitrary boost for category match
+        ranked_idxs = np.argsort(scores)[::-1][:TOP_K]
+        ranked_titles = [titles[i] for i in ranked_idxs]
+        # precision@1
+        if ranked_titles and ranked_titles[0].lower() == expected.lower():
+            correct_at1 += 1
+        rr = 0.0
+        for rank, title in enumerate(ranked_titles, start=1):
+            if title.lower() == expected.lower():
+                rr = 1.0 / rank
+                break
+        rr_sum += rr
+    total = len(queries)
+    print(f"Precision@1: {correct_at1/total:.4f}")
+    print(f"MRR:         {rr_sum/total:.4f}")
+
+if __name__ == '__main__':
+    titles, texts, categories = load_documents()
+    print(f"Loaded {len(titles)} documents")
+
+    from collections import defaultdict
+    categories_map = defaultdict(list)
+    for i, cats in enumerate(categories):
+        for c in cats:
+            categories_map[c].append(i)
+
+    queries = load_questions()
+    bm25, tokenized = get_bm25(texts)
+
+    evaluate(titles, texts, categories_map, bm25, tokenized, queries)
+
+Precision@1: 0.1200
+MRR:         0.1712

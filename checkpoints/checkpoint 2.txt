@@ -1,0 +1,270 @@
+import os
+import re
+import pickle
+import numpy as np
+from sentence_transformers import SentenceTransformer, CrossEncoder
+import faiss
+from rank_bm25 import BM25Okapi
+from sklearn.linear_model import LogisticRegression
+
+# Paths and parameters
+WIKI_DIR = "wiki-subset"
+QUESTIONS_FILE = "questions.txt"
+TOP_K = 10
+BM25_K = 50
+MODEL_NAME = 'all-MiniLM-L6-v2'
+CROSS_ENCODER_MODEL = 'cross-encoder/ms-marco-MiniLM-L-12-v2'
+SNIPPET_WORDS = 500
+BATCH_SIZE = 64
+FAISS_INDEX_FILE = "faiss_hnsw.index"
+BM25_INDEX_FILE = "bm25.pkl"
+EMB_FILE = "embeddings.npy"
+RANKER_FILE = "ranker.pkl"
+
+# 1. Load Wikipedia docs with category parsing and cleanup
+#    - Extract title (from [[Title]])
+#    - Extract categories (line starting with "CATEGORIES:")
+#    - Remove [tpl]...[/tpl] tags
+#    - Normalize section headers (==Header== -> " Header ")
+def load_documents():
+    titles, texts, categories = [], [], []
+    title, buffer, cats = None, [], []
+    tpl_re = re.compile(r"\[tpl\].*?\[/tpl\]")
+    section_re = re.compile(r"^=+(.*?)=+$")
+    for root, _, files in os.walk(WIKI_DIR):
+        for fname in files:
+            path = os.path.join(root, fname)
+            with open(path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = tpl_re.sub('', line).strip()
+                    m = re.match(r'^\[\[(.+?)\]\]', line)
+                    if m:
+                        if title:
+                            titles.append(title)
+                            texts.append(' '.join(buffer))
+                            categories.append(cats)
+                        title = m.group(1)
+                        buffer = []
+                        cats = []
+                    elif line.startswith('CATEGORIES:'):
+                        cat_list = line.split(':',1)[1].split(',')
+                        cats = [c.strip().lower() for c in cat_list]
+                    else:
+                        if title:
+                            sh = section_re.match(line)
+                            if sh:
+                                buffer.append(sh.group(1))
+                            else:
+                                buffer.append(line)
+                if title:
+                    titles.append(title)
+                    texts.append(' '.join(buffer))
+                    categories.append(cats)
+    return titles, texts, categories
+
+# 2. Load Jeopardy questions (capture category)
+def load_questions():
+    queries = []
+    with open(QUESTIONS_FILE, 'r', encoding='utf-8') as f:
+        block = []
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                if len(block) == 3:
+                    qcat = block[0].strip().lower()
+                    clue = block[1]
+                    expected = block[2]
+                    queries.append((qcat, clue, expected))
+                block = []
+            else:
+                block.append(line)
+        if len(block) == 3:
+            qcat, clue, expected = block[0].strip().lower(), block[1], block[2]
+            queries.append((qcat, clue, expected))
+    return queries
+
+# 3. BM25 index load/build
+def get_bm25(texts):
+    if os.path.exists(BM25_INDEX_FILE):
+        print(f"Loading BM25 index from {BM25_INDEX_FILE}...")
+        with open(BM25_INDEX_FILE, 'rb') as f:
+            bm25, tokenized = pickle.load(f)
+    else:
+        print("Building BM25 index and saving to disk...")
+        tokenized = [doc.lower().split() for doc in texts]
+        bm25 = BM25Okapi(tokenized)
+        with open(BM25_INDEX_FILE, 'wb') as f:
+            pickle.dump((bm25, tokenized), f)
+    return bm25, tokenized
+
+# 4. FAISS index + embeddings load/build
+def get_faiss_index(texts, model):
+    if os.path.exists(FAISS_INDEX_FILE) and os.path.exists(EMB_FILE):
+        print(f"Loading FAISS index and embeddings from disk...")
+        index = faiss.read_index(FAISS_INDEX_FILE)
+        embeddings = np.load(EMB_FILE)
+    else:
+        print("Building FAISS index and embeddings, saving to disk...")
+        embeddings = []
+        for i in range(0, len(texts), BATCH_SIZE):
+            batch = texts[i:i+BATCH_SIZE]
+            emb = model.encode(batch,
+                               batch_size=BATCH_SIZE,
+                               show_progress_bar=True,
+                               convert_to_numpy=True)
+            embeddings.append(emb)
+        embeddings = np.vstack(embeddings)
+        faiss.normalize_L2(embeddings)
+        np.save(EMB_FILE, embeddings)
+        dim = embeddings.shape[1]
+        index = faiss.IndexHNSWFlat(dim, 32)
+        index.hnsw.efConstruction = 200
+        index.add(embeddings)
+        index.hnsw.efSearch = 50
+        faiss.write_index(index, FAISS_INDEX_FILE)
+    return index, embeddings
+
+# 5. Train a small ranker using features (vectorized cross-encoder calls)
+def train_ranker(titles, texts, categories, bm25, tokenized, index, embeddings, dense_model, cross_encoder, queries):
+    X, y = [], []
+    print("Training ranker on features for all queries (including category match)...")
+    for qcat, clue, expected in queries:
+        # BM25 retrieval
+        q_tokens = clue.lower().split()
+        bm25_scores = bm25.get_scores(q_tokens)
+        top_bm25 = np.argsort(bm25_scores)[::-1][:BM25_K]
+        # Dense retrieval
+        q_emb = dense_model.encode([clue], batch_size=1, convert_to_numpy=True).flatten()
+        faiss.normalize_L2(q_emb.reshape(1, -1))
+        sims, idxs = index.search(q_emb.reshape(1, -1), TOP_K)
+        top_dense = idxs[0]
+        # Union of candidates
+        union = list(dict.fromkeys(list(top_dense) + top_bm25.tolist()))[: TOP_K + BM25_K]
+        # Cross-encoder scores
+        snippets = [' '.join(texts[i].split()[:SNIPPET_WORDS]) for i in union]
+        pairs = [[clue, snippet] for snippet in snippets]
+        ce_scores = cross_encoder.predict(pairs)
+        # Build feature vectors (BM25, dense, CE, category match)
+        for idx, ce_score in zip(union, ce_scores):
+            bm_val = float(bm25_scores[idx])
+            dn_val = float(np.dot(q_emb, embeddings[idx]).item())
+            ce_val = float(ce_score)
+            cat_val = 1.0 if qcat in categories[idx] else 0.0
+            X.append([bm_val, dn_val, ce_val, cat_val])
+            y.append(1 if titles[idx].lower() == expected.lower() else 0)
+    # Train logistic regression
+    model = LogisticRegression(max_iter=500)
+    model.fit(X, y)
+    with open(RANKER_FILE, 'wb') as f:
+        pickle.dump(model, f)
+    print("Ranker training complete, saved to", RANKER_FILE)
+    return model
+
+# 6. Evaluate using trained ranker
+def evaluate(titles, texts, categories_map, bm25, tokenized, index, embeddings, dense_model, cross_encoder, ranker, queries):
+    correct_at1, rr_sum = 0, 0.0
+    for qcat, clue, expected in queries:
+        qcat = qcat.lower()
+        # Candidate retrieval: restrict to docs matching category
+        pool = set(categories_map.get(qcat, []))
+        if not pool:
+            pool = set(range(len(titles)))
+
+        # BM25 scores and mask outside pool
+        q_tokens = clue.lower().split()
+        bm25_scores = bm25.get_scores(q_tokens)
+        masked = np.full_like(bm25_scores, -1e9)
+        for i in pool:
+            masked[i] = bm25_scores[i]
+        top_bm25 = np.argsort(masked)[::-1][:BM25_K]
+
+        # Dense retrieval on full index
+        q_emb = dense_model.encode([clue], batch_size=1, convert_to_numpy=True).flatten()
+        faiss.normalize_L2(q_emb.reshape(1, -1))
+        sims, idxs = index.search(q_emb.reshape(1, -1), TOP_K)
+        top_dense = [i for i in idxs[0] if i in pool][:TOP_K]
+
+        # Union candidates
+        union = list(dict.fromkeys(top_dense + top_bm25.tolist()))[:TOP_K+BM25_K]
+
+        # Feature assembly
+        snippets = [' '.join(texts[i].split()[:SNIPPET_WORDS]) for i in union]
+        pairs = [[clue, snippet] for snippet in snippets]
+        ce_scores = cross_encoder.predict(pairs)
+        feats, cands = [], []
+        for idx, ce_score in zip(union, ce_scores):
+            f1 = float(bm25_scores[idx])
+            f2 = float(np.dot(q_emb, embeddings[idx]))
+            f3 = float(ce_score)
+            f4 = 1.0 if qcat in categories[idx] else 0.0
+            feats.append([f1, f2, f3, f4])
+            cands.append(titles[idx])
+
+        # Rank with learned model
+        probs = ranker.predict_proba(feats)[:,1]
+        order = np.argsort(probs)[::-1]
+        ranked = [cands[i] for i in order]
+
+        # Compute metrics
+        if ranked and ranked[0].lower() == expected.lower():
+            correct_at1 += 1
+        rr = 0.0
+        for rank, title in enumerate(ranked, start=1):
+            if title.lower() == expected.lower():
+                rr = 1.0 / rank
+                break
+        rr_sum += rr
+
+    total = len(queries)
+    print(f"Precision@1: {correct_at1/total:.4f}")
+    print(f"MRR:         {rr_sum/total:.4f}")
+
+if __name__ == '__main__':
+    # Load and parse Wikipedia subset
+    titles, texts, categories = load_documents()
+    print(f"Loaded {len(titles)} articles with parsed categories")
+
+    # Build category to doc index map
+    from collections import defaultdict
+    categories_map = defaultdict(list)
+    for i, cats in enumerate(categories):
+        for cat in cats:
+            categories_map[cat].append(i)
+
+    # Load Jeopardy questions (include category)
+    queries = load_questions()
+
+    # Build or load BM25 and dense indices
+    bm25, tokenized = get_bm25(texts)
+    dense_model = SentenceTransformer(MODEL_NAME)
+    cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL, device='cpu')
+    index, embeddings = get_faiss_index(texts, dense_model)
+
+    # Train or load ranker
+    if os.path.exists(RANKER_FILE):
+        print("Loading trained ranker...")
+        with open(RANKER_FILE, 'rb') as f:
+            ranker = pickle.load(f)
+    else:
+        ranker = train_ranker(titles, texts, categories, bm25, tokenized,
+                              index, embeddings,
+                              dense_model, cross_encoder,
+                              queries)
+
+    # Evaluate with category filtering
+    print(f"Evaluating {len(queries)} questions with category-filtered ranking...")
+    evaluate(titles, texts, categories_map,
+             bm25, tokenized,
+             index, embeddings,
+             dense_model, cross_encoder,
+             ranker, queries)
+
+
+Loaded 280107 articles with parsed categories
+Loading BM25 index from bm25.pkl...
+Loading FAISS index and embeddings from disk...
+Training ranker on features for all queries (including category match)...
+Ranker training complete, saved to ranker.pkl
+Evaluating 100 questions with category-filtered ranking...
+Precision@1: 0.2300
+MRR:         0.2884
